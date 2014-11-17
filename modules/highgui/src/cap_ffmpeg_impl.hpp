@@ -771,7 +771,7 @@ double CvCapture_FFMPEG::getProperty( int property_id )
         return (double)frame.height;
     case CV_FFMPEG_CAP_PROP_FPS:
 #if LIBAVCODEC_BUILD > 4753
-        return av_q2d(video_st->r_frame_rate);
+        return av_q2d(video_st->avg_frame_rate);
 #else
         return (double)video_st->codec.frame_rate
                 / (double)video_st->codec.frame_rate_base;
@@ -818,7 +818,7 @@ int CvCapture_FFMPEG::get_bitrate()
 
 double CvCapture_FFMPEG::get_fps()
 {
-    double fps = r2d(ic->streams[video_stream]->r_frame_rate);
+    double fps = r2d(ic->streams[video_stream]->avg_frame_rate);
 
 #if LIBAVFORMAT_BUILD >= CALC_FFMPEG_VERSION(52, 111, 0)
     if (fps < eps_zero)
@@ -1213,7 +1213,6 @@ static int icv_av_write_frame_FFMPEG( AVFormatContext * oc, AVStream * video_st,
 #else
     AVCodecContext * c = &(video_st->codec);
 #endif
-    int out_size;
     int ret = 0;
 
     if (oc->oformat->flags & AVFMT_RAWPICTURE) {
@@ -1233,24 +1232,39 @@ static int icv_av_write_frame_FFMPEG( AVFormatContext * oc, AVStream * video_st,
 
         ret = av_write_frame(oc, &pkt);
     } else {
-        /* encode the image */
-        out_size = avcodec_encode_video(c, outbuf, outbuf_size, picture);
-        /* if zero size, it means the image was buffered */
-        if (out_size > 0) {
-            AVPacket pkt;
-            av_init_packet(&pkt);
+        AVPacket pkt;
+        int got_output;
 
-#if LIBAVFORMAT_BUILD > 4752
-            if(c->coded_frame->pts != (int64_t)AV_NOPTS_VALUE)
-                pkt.pts = av_rescale_q(c->coded_frame->pts, c->time_base, video_st->time_base);
-#else
+        av_init_packet(&pkt);
+#if LIBAVCODEC_VERSION_INT < AV_VERSION_INT(54, 1, 0)
+        /* encode the image */
+        int out_size = avcodec_encode_video(c, outbuf, outbuf_size, picture);
+        got_output = out_size > 0;
+        pkt.data   = outbuf;
+        pkt.size   = out_size;
+        if(c->coded_frame->pts != (int64_t)AV_NOPTS_VALUE)
             pkt.pts = c->coded_frame->pts;
+        pkt.dts = AV_NOPTS_VALUE;
+        if(c->coded_frame->key_frame)
+            pkt.flags |= PKT_FLAG_KEY;
+#else
+        pkt.data = NULL;
+        pkt.size = 0;
+
+        ret = avcodec_encode_video2(c, &pkt, picture, &got_output);
+        if (ret < 0)
+            got_output = 0;
 #endif
-            if(c->coded_frame->key_frame)
-                pkt.flags |= PKT_FLAG_KEY;
+
+        if (got_output) {
+            if (pkt.pts != (int64_t)AV_NOPTS_VALUE)
+                pkt.pts = av_rescale_q(pkt.pts, c->time_base, video_st->time_base);
+            if (pkt.dts != (int64_t)AV_NOPTS_VALUE)
+                pkt.dts = av_rescale_q(pkt.dts, c->time_base, video_st->time_base);
+            if (pkt.duration)
+                pkt.duration = av_rescale_q(pkt.duration, c->time_base, video_st->time_base);
+
             pkt.stream_index= video_st->index;
-            pkt.data= outbuf;
-            pkt.size= out_size;
 
             /* write the compressed frame in the media file */
             ret = av_write_frame(oc, &pkt);
@@ -1502,7 +1516,7 @@ bool CvVideoWriter_FFMPEG::open( const char * filename, int fourcc,
     if( (codec_id = codec_get_bmp_id( fourcc )) == CV_CODEC(CODEC_ID_NONE) )
         return false;
 #else
-    const struct AVCodecTag * tags[] = { codec_bmp_tags, NULL};
+    const struct AVCodecTag * tags[] = { avformat_get_riff_video_tags(), NULL};
     if( (codec_id = av_codec_get_id(tags, fourcc)) == CV_CODEC(CODEC_ID_NONE) )
         return false;
 #endif
